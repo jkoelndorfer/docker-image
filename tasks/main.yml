@@ -1,0 +1,107 @@
+---
+
+- name: set local_become fact | {{ image_name }}
+  set_fact:
+    docker_local_become_: "{{ docker_local_become | default('no') }}"
+
+- name: install docker python module | {{ image_name }}
+  delegate_to: localhost
+  run_once: yes
+  pip: name=docker
+  become: yes
+
+- name: build Docker image | {{ image_name }}
+  delegate_to: localhost
+  run_once: yes
+  become: "{{ docker_local_become_ }}"
+  docker_image:
+    name: "{{ image_name }}"
+    state: "{{ state | default(omit) }}"
+    path: "{{ path | default(omit) }}"
+    buildargs: "{{ buildargs | default(omit) }}"
+    force: "{{ force | default(omit) }}"
+    nocache: "{{ nocache | default(omit) }}"
+    pull: "{{ pull | default(omit) }}"
+    tag: "{{ tag | default(omit) }}"
+
+- name: get built image ID | {{ image_name }}
+  delegate_to: localhost
+  run_once: yes
+  become: "{{ docker_local_become_ }}"
+  command: docker images -q {{ image_name }}:{{ tag }} --no-trunc
+  changed_when: False
+  register: docker_image_id_result
+
+- name: check if image is present on remote host | {{ image_name }}
+  shell: docker images -q --no-trunc | grep -Eq ^{{ docker_image_id_result.stdout | trim | quote }}\$
+  become: yes
+  register: docker_image_present_result
+  changed_when: docker_image_present_result.rc != 0
+  failed_when: False
+  ignore_errors: yes
+  # We don't need to push the image if we're executing against the local system
+  when: >
+    (inventory_hostname != "localhost" and ansible_connection != "local" and push_to_inventory_host is undefined)
+    or push_to_inventory_host
+
+- block:
+  - name: create local temporary file for image archive | {{ image_name }}
+    delegate_to: localhost
+    run_once: yes
+    become: "{{ docker_local_become_ }}"
+    command: mktemp --tmpdir docker-image.XXXXXX.tar
+    register: docker_local_image_archive_tempfile_
+
+  - name: create remote temporary file for image archive | {{ image_name }}
+    become: yes
+    command: mktemp --tmpdir docker-image.XXXXXX.tar
+    register: docker_remote_image_archive_tempfile_
+
+  - name: set Docker image tempfile facts | {{ image_name }}
+    set_fact:
+      docker_local_image_archive_tempfile: "{{ docker_local_image_archive_tempfile_.stdout | trim }}"
+      docker_remote_image_archive_tempfile: "{{ docker_remote_image_archive_tempfile_.stdout | trim }}"
+
+  - name: set permissions on image archive | {{ image_name }}
+    delegate_to: localhost
+    run_once: yes
+    become: "{{ docker_local_become_ }}"
+    file:
+      path: "{{ docker_local_image_archive_tempfile }}"
+      mode: 644
+
+  - name: export image | {{ image_name }}
+    delegate_to: localhost
+    run_once: yes
+    command: docker save -o {{ docker_local_image_archive_tempfile | quote }} {{ image_name | quote }}:{{ tag | quote }}
+
+  - name: copy image to remote host | {{ image_name }}
+    become: yes
+    copy:
+      src: "{{ docker_local_image_archive_tempfile }}"
+      dest: "{{ docker_remote_image_archive_tempfile }}"
+      owner: root
+      group: root
+      mode: 444
+
+  - name: import image on remote host | {{ image_name }}
+    become: yes
+    command: docker load --input {{ docker_remote_image_archive_tempfile }}
+
+
+  always:
+    - name: remove local temporary file for image archive | {{ image_name }}
+      delegate_to: localhost
+      become: "{{ docker_local_become_ }}"
+      file:
+        path: "{{ docker_local_image_archive_tempfile }}"
+        state: absent
+
+    - name: remove remote temporary file for image archive | {{ image_name }}
+      become: yes
+      file:
+        path: "{{ docker_remote_image_archive_tempfile }}"
+        state: absent
+
+
+  when: docker_image_present_result | changed
